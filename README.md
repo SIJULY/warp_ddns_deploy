@@ -26,9 +26,44 @@ RECORD_NAME=需要更新的域名 (如 warp.example.com)
 INTERVAL_MINUTES=60
 ```
 
-### 2. 使用 Docker Compose 运行
+### 3. 使用 Docker Compose 运行
 
 确保系统中已经安装好 Docker 和 Docker Compose，然后在项目根目录下运行：
+
+
+### 2. 参数获取指南
+
+#### CF_TOKEN (Cloudflare API Token)
+1. 登录 [Cloudflare 控制台](https://dash.cloudflare.com/)。
+2. 点击右上角的 "我的个人资料" -> 选择左侧边栏的 "API 令牌" (API Tokens)。
+3. 点击 "创建令牌" (Create Token)。
+4. 在最下方的 "自定义令牌" (Custom Token) 处点击 "开始使用"。
+5. **权限设置** (Permissions)：
+   * 选择 **Zone** -> **DNS** -> **编辑 (Edit)**。
+6. **区域资源** (Zone Resources)：
+   * 选择 **Include** -> **Specific Zone** -> 选择你的目标域名（例如 `example.com`）。
+7. 点击 "继续以摘要" -> "创建令牌"。
+8. 复制生成的 Token，这就是 `CF_TOKEN`，**注意该 Token 只会显示一次，请妥善保存**。
+
+#### ZONE_ID (区域 ID)
+1. 登录 Cloudflare 后，在主页点击你的主域名（例如 `example.com`）。
+2. 在该域名的**概述 (Overview)** 页面。
+3. 往右下方滑动页面，找到 **API** 区域。
+4. 复制其中的 **区域 ID (Zone ID)**。
+
+#### RECORD_NAME (解析域名)
+你需要更新的具体子域名，例如 `warp.example.com`。
+
+#### RECORD_ID (DNS 记录 ID)
+1. 确保在 Cloudflare 的 "DNS -> 记录" 页面已经手动添加了该子域名的 A 记录（如 `warp`），IP 可以先随便填一个（如 `1.1.1.1`），**代理状态（Proxy status）必须设置为 "仅 DNS" (DNS only - 灰色云朵)**。
+2. 可以在 Linux/macOS 终端运行以下 `curl` 命令来获取 `RECORD_ID`（将下面的替换为你获取到的信息）：
+```bash
+curl -X GET "https://api.cloudflare.com/client/v4/zones/<你的_ZONE_ID>/dns_records?name=<你的_RECORD_NAME>" \
+     -H "Authorization: Bearer <你的_CF_TOKEN>" \
+     -H "Content-Type: application/json"
+```
+在返回的 JSON 结果中，找到 `"id": "xxxxxxxxxxxxx"`，这串较长的字母数字组合即为 `RECORD_ID`。
+
 
 ```bash
 docker-compose up -d --build
