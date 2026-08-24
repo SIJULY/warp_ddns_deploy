@@ -13,6 +13,7 @@ import socket
 import json
 import urllib.request
 import os
+import signal
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
@@ -25,6 +26,9 @@ RECORD_ID = os.getenv("RECORD_ID")
 RECORD_NAME = os.getenv("RECORD_NAME")
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "60"))
 
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
+
 # 固定 WG 身份
 PREFERRED_IP_PRIVATE_KEY = "8I2+WOh1grMu8HaW6JTwg+B3Oh7fOPnqj4xpMWn3FU0="
 PREFERRED_IP_PEER_PUBLIC_KEY = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
@@ -36,6 +40,51 @@ WG_CONSTRUCTION = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
 WG_IDENTIFIER = b"WireGuard v1 zx2c4 Jason@zx2c4.com"
 WG_LABEL_MAC1 = b"mac1----"
 # =============================================================
+
+def send_tg_msg(text):
+    """通过 Telegram API 发送消息"""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    data = json.dumps({"chat_id": TG_CHAT_ID, "text": text}).encode('utf-8')
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"⚠️ Telegram 消息发送失败: {e}")
+
+async def poll_telegram(trigger_event):
+    """后台长轮询监听 Telegram 指令，打断休眠"""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+        
+    offset = 0
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getUpdates"
+    
+    def fetch_updates():
+        req_url = f"{url}?offset={offset}&timeout=30"
+        try:
+            with urllib.request.urlopen(req_url, timeout=35) as response:
+                return json.loads(response.read().decode('utf-8'))
+        except Exception:
+            return None
+
+    while True:
+        try:
+            data = await asyncio.to_thread(fetch_updates)
+            if data and data.get("ok"):
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    msg = update.get("message", {})
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                    text = msg.get("text", "")
+                    
+                    if chat_id == TG_CHAT_ID and text.strip().lower() == "/warp":
+                        send_tg_msg("⚡ 收到指令：立即中断休眠，强制重新优选 WARP 节点！")
+                        trigger_event.set()
+        except Exception:
+            pass
+        await asyncio.sleep(1)
 
 def get_random_ips(count=100):
     networks = [list(ipaddress.ip_network(cidr).hosts()) for cidr in CF_WARP_IPV4_CIDRS]
@@ -80,21 +129,17 @@ def build_wireguard_initiation(private_key_b64, peer_public_key_b64):
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
     )
-
     chaining_key = _blake2s(WG_CONSTRUCTION)
     handshake_hash = _blake2s(chaining_key + WG_IDENTIFIER)
     handshake_hash = _blake2s(handshake_hash + responder_public_bytes)
     chaining_key = _kdf(chaining_key, ephemeral_public, 1)[0]
     handshake_hash = _blake2s(handshake_hash + ephemeral_public)
-
     chaining_key, key = _kdf(chaining_key, ephemeral_private.exchange(responder_public), 2)
     encrypted_static = ChaCha20Poly1305(key).encrypt(b"\0" * 12, static_public, handshake_hash)
     handshake_hash = _blake2s(handshake_hash + encrypted_static)
-
     chaining_key, key = _kdf(chaining_key, static_private.exchange(responder_public), 2)
     encrypted_timestamp = ChaCha20Poly1305(key).encrypt(b"\0" * 12, _tai64n_now(), handshake_hash)
     handshake_hash = _blake2s(handshake_hash + encrypted_timestamp)
-
     sender_index = secrets.token_bytes(4)
     message = struct.pack("<I", 1) + sender_index + ephemeral_public + encrypted_static + encrypted_timestamp
     mac1_key = _blake2s(WG_LABEL_MAC1 + responder_public_bytes)
@@ -163,8 +208,9 @@ async def scan_warp_ips():
     valid_results.sort(key=lambda x: x[1])
 
     if not valid_results:
-        print("❌ 没有 IP 返回可验证的 WireGuard 握手响应。")
-        return None
+        msg = "❌ 没有 IP 返回可验证的 WireGuard 握手响应。"
+        print(msg)
+        return None, msg
 
     finalist_ips = [ip for ip, _ in valid_results[:finalists]]
     print(f"[{time.strftime('%H:%M:%S')}] ✅ 初筛发现 {len(valid_results)} 个 IP，正对前 {len(finalist_ips)} 名复测 {repeat_count} 次...")
@@ -187,8 +233,9 @@ async def scan_warp_ips():
     ranked.sort(key=lambda item: (-item["successes"], item["median_ms"] if item["median_ms"] is not None else float("inf"), item["jitter_ms"]))
     
     best = ranked[0]
-    print(f"🎯 最终优选结果: {best['ip']} (成功率: {best['successes']}/{repeat_count}, 延迟中位: {best['median_ms']}ms, 抖动: {best['jitter_ms']}ms)")
-    return best["ip"]
+    res_msg = f"🎯 优选结果: {best['ip']}\n⏱ 成功率: {best['successes']}/{repeat_count} | 延迟: {best['median_ms']}ms | 抖动: {best['jitter_ms']}ms"
+    print(res_msg)
+    return best["ip"], res_msg
 
 def update_cloudflare_ddns(ip):
     print(f"🌐 正在将优选 IP ({ip}) 更新到 Cloudflare DDNS ({RECORD_NAME})...")
@@ -197,24 +244,23 @@ def update_cloudflare_ddns(ip):
         "Authorization": f"Bearer {CF_TOKEN}",
         "Content-Type": "application/json"
     }
-    data = json.dumps({
-        "type": "A",
-        "name": RECORD_NAME,
-        "content": ip,
-        "ttl": 1,
-        "proxied": False
-    }).encode("utf-8")
-    
+    data = json.dumps({"type": "A", "name": RECORD_NAME, "content": ip, "ttl": 1, "proxied": False}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="PUT")
     try:
         with urllib.request.urlopen(req) as response:
             resp_data = json.loads(response.read().decode("utf-8"))
             if resp_data.get("success"):
-                print("🎉 DDNS 更新成功！\n")
+                msg = f"🎉 DDNS 更新成功！"
+                print(msg + "\n")
+                return True, msg
             else:
-                print(f"❌ DDNS 更新失败，API 返回错误: {resp_data.get('errors')}\n")
+                msg = f"❌ DDNS 更新失败: {resp_data.get('errors')}"
+                print(msg + "\n")
+                return False, msg
     except Exception as e:
-        print(f"❌ 请求 Cloudflare API 发生异常: {e}\n")
+        msg = f"❌ 请求 Cloudflare API 发生异常: {e}"
+        print(msg + "\n")
+        return False, msg
 
 async def main_loop():
     if not all([CF_TOKEN, ZONE_ID, RECORD_ID, RECORD_NAME]):
@@ -222,23 +268,64 @@ async def main_loop():
         return
         
     print("==========================================")
-    print("🐉 小龙女她爸 - WARP DDNS 自动化任务已启动")
+    print("🐉 WARP DDNS 自动化任务已启动")
     print(f"📌 目标域名: {RECORD_NAME}")
     print(f"⏱️  执行间隔: {INTERVAL_MINUTES} 分钟")
+    
+    trigger_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGUSR1, lambda: trigger_event.set())
+    
+    if TG_BOT_TOKEN and TG_CHAT_ID:
+        asyncio.create_task(poll_telegram(trigger_event))
+        print("🤖 Telegram 机器人监听已启动，随时发送 /warp 手动触发")
     print("==========================================\n")
+    
+    current_active_ip = None
+    force_rescan = True 
     
     while True:
         try:
-            best_ip = await scan_warp_ips()
-            if best_ip:
-                update_cloudflare_ddns(best_ip)
-            else:
-                print("未找到有效节点，中止本次更新。\n")
-        except Exception as e:
-            print(f"执行周期内发生异常: {e}\n")
+            need_rescan = force_rescan
             
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 进入休眠，{INTERVAL_MINUTES} 分钟后唤醒...\n")
-        await asyncio.sleep(INTERVAL_MINUTES * 60)
+            if current_active_ip and not force_rescan:
+                print(f"[{time.strftime('%H:%M:%S')}] 🔍 正在检测当前在用节点 ({current_active_ip}) 的连通性...")
+                _, latency = await async_wireguard_ping(current_active_ip, PREFERRED_IP_PRIVATE_KEY, PREFERRED_IP_PEER_PUBLIC_KEY, timeout=2.5)
+                
+                if latency >= 0:
+                    print(f"✅ 当前节点依然畅通 (延迟: {latency}ms)，跳过本轮优选。\n")
+                    need_rescan = False
+                else:
+                    msg = f"❌ 当前节点 {current_active_ip} 已失效或被阻断，准备重新优选..."
+                    print(msg)
+                    send_tg_msg(msg)
+                    need_rescan = True
+                    
+            if need_rescan:
+                best_ip, stats_msg = await scan_warp_ips()
+                if best_ip:
+                    success, ddns_msg = update_cloudflare_ddns(best_ip)
+                    if success:
+                        current_active_ip = best_ip
+                    send_tg_msg(f"{stats_msg}\n{ddns_msg}")
+                else:
+                    print("未找到有效节点，中止本次更新。\n")
+                    send_tg_msg(stats_msg)
+                    
+        except Exception as e:
+            err_msg = f"执行周期内发生异常: {e}"
+            print(err_msg + "\n")
+            send_tg_msg(f"❌ {err_msg}")
+            
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 进入休眠，等待 {INTERVAL_MINUTES} 分钟自动执行，或等待 Telegram 手动信号...\n")
+        
+        try:
+            await asyncio.wait_for(trigger_event.wait(), timeout=INTERVAL_MINUTES * 60)
+            print(f"\n[{time.strftime('%H:%M:%S')}] ⚡ 接收到手动触发信号，立即中断休眠并强制重新测速！")
+            trigger_event.clear()
+            force_rescan = True
+        except asyncio.TimeoutError:
+            force_rescan = False 
 
 if __name__ == "__main__":
     asyncio.run(main_loop())
