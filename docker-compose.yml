@@ -1,0 +1,14 @@
+services:
+  warp-ddns:
+    build: .
+    container_name: xlntb-warp-ddns
+    restart: unless-stopped
+    env_file:
+      - .env
+    # 使用 host 网络，防止 Docker bridge NAT 的端口映射导致 UDP RTT 延迟测不准
+    network_mode: "host" 
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
