@@ -29,7 +29,6 @@ INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "60"))
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
-# 固定 WG 身份
 PREFERRED_IP_PRIVATE_KEY = "8I2+WOh1grMu8HaW6JTwg+B3Oh7fOPnqj4xpMWn3FU0="
 PREFERRED_IP_PEER_PUBLIC_KEY = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 
@@ -42,7 +41,6 @@ WG_LABEL_MAC1 = b"mac1----"
 # =============================================================
 
 def send_tg_msg(text):
-    """通过 Telegram API 发送消息"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -54,10 +52,8 @@ def send_tg_msg(text):
         print(f"⚠️ Telegram 消息发送失败: {e}")
 
 async def poll_telegram(trigger_event):
-    """后台长轮询监听 Telegram 指令，打断休眠"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
-        
     offset = 0
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getUpdates"
     
@@ -76,10 +72,7 @@ async def poll_telegram(trigger_event):
                 for update in data.get("result", []):
                     offset = update["update_id"] + 1
                     msg = update.get("message", {})
-                    chat_id = str(msg.get("chat", {}).get("id", ""))
-                    text = msg.get("text", "")
-                    
-                    if chat_id == TG_CHAT_ID and text.strip().lower() == "/warp":
+                    if str(msg.get("chat", {}).get("id", "")) == TG_CHAT_ID and msg.get("text", "").strip().lower() == "/warp":
                         send_tg_msg("⚡ 收到指令：立即中断休眠，强制重新优选 WARP 节点！")
                         trigger_event.set()
         except Exception:
@@ -96,21 +89,15 @@ def get_random_ips(count=100):
     random.shuffle(selected)
     return selected
 
-def _blake2s(data, *, key=b"", digest_size=32):
-    return hashlib.blake2s(data, key=key, digest_size=digest_size).digest()
-
-def _hmac_blake2s(key, data):
-    return hmac.new(key, data, hashlib.blake2s).digest()
-
+def _blake2s(data, *, key=b"", digest_size=32): return hashlib.blake2s(data, key=key, digest_size=digest_size).digest()
+def _hmac_blake2s(key, data): return hmac.new(key, data, hashlib.blake2s).digest()
 def _kdf(chaining_key, input_material, outputs):
     temp_key = _hmac_blake2s(chaining_key, input_material)
-    values = []
-    output_block = b""
+    values = []; output_block = b""
     for i in range(1, outputs + 1):
         output_block = _hmac_blake2s(temp_key, output_block + bytes([i]))
         values.append(output_block)
     return tuple(values)
-
 def _tai64n_now():
     now_ns = time.time_ns()
     seconds, nanoseconds = divmod(now_ns, 1_000_000_000)
@@ -118,17 +105,11 @@ def _tai64n_now():
 
 def build_wireguard_initiation(private_key_b64, peer_public_key_b64):
     static_private = X25519PrivateKey.from_private_bytes(base64.b64decode(private_key_b64, validate=True))
-    static_public = static_private.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
-    )
+    static_public = static_private.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
     responder_public_bytes = base64.b64decode(peer_public_key_b64, validate=True)
     responder_public = X25519PublicKey.from_public_bytes(responder_public_bytes)
     ephemeral_private = X25519PrivateKey.generate()
-    ephemeral_public = ephemeral_private.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
-    )
+    ephemeral_public = ephemeral_private.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
     chaining_key = _blake2s(WG_CONSTRUCTION)
     handshake_hash = _blake2s(chaining_key + WG_IDENTIFIER)
     handshake_hash = _blake2s(handshake_hash + responder_public_bytes)
@@ -144,15 +125,12 @@ def build_wireguard_initiation(private_key_b64, peer_public_key_b64):
     message = struct.pack("<I", 1) + sender_index + ephemeral_public + encrypted_static + encrypted_timestamp
     mac1_key = _blake2s(WG_LABEL_MAC1 + responder_public_bytes)
     message += _blake2s(message, key=mac1_key, digest_size=16) + (b"\0" * 16)
-    state = (sender_index, ephemeral_private, static_private, chaining_key, handshake_hash)
-    return message, state
+    return message, (sender_index, ephemeral_private, static_private, chaining_key, handshake_hash)
 
 def validate_wireguard_response(response, state):
-    if len(response) != 92 or struct.unpack_from("<I", response)[0] != 2:
-        return False
+    if len(response) != 92 or struct.unpack_from("<I", response)[0] != 2: return False
     sender_index, ephemeral_private, static_private, chaining_key, handshake_hash = state
-    if response[8:12] != sender_index:
-        return False
+    if response[8:12] != sender_index: return False
     responder_ephemeral_bytes = response[12:44]
     responder_ephemeral = X25519PublicKey.from_public_bytes(responder_ephemeral_bytes)
     handshake_hash = _blake2s(handshake_hash + responder_ephemeral_bytes)
@@ -169,23 +147,18 @@ async def async_wireguard_ping(ip, private_key_b64, peer_public_key_b64, timeout
         msg, state = build_wireguard_initiation(private_key_b64, peer_public_key_b64)
         start_time = time.perf_counter()
         await loop.sock_sendto(sock, msg, (ip, WARP_PORT))
-        
         while True:
             elapsed = time.perf_counter() - start_time
-            if elapsed >= timeout:
-                return ip, -1
+            if elapsed >= timeout: return ip, -1
             try:
                 data, _ = await asyncio.wait_for(loop.sock_recvfrom(sock, 1024), timeout - elapsed)
                 if validate_wireguard_response(data, state):
                     return ip, round((time.perf_counter() - start_time) * 1000, 2)
             except asyncio.TimeoutError:
                 return ip, -1
-            except Exception:
-                pass
-    except Exception:
-        return ip, -1
-    finally:
-        sock.close()
+            except Exception: pass
+    except Exception: return ip, -1
+    finally: sock.close()
 
 async def scan_warp_ips():
     sample_size = 100
@@ -202,10 +175,8 @@ async def scan_warp_ips():
         async with semaphore:
             return await async_wireguard_ping(ip, PREFERRED_IP_PRIVATE_KEY, PREFERRED_IP_PEER_PUBLIC_KEY)
 
-    tasks = [probe(ip) for ip in ips]
-    results = await asyncio.gather(*tasks)
-    valid_results = [(ip, lat) for ip, lat in results if lat >= 0]
-    valid_results.sort(key=lambda x: x[1])
+    results = await asyncio.gather(*(probe(ip) for ip in ips))
+    valid_results = sorted([(ip, lat) for ip, lat in results if lat >= 0], key=lambda x: x[1])
 
     if not valid_results:
         msg = "❌ 没有 IP 返回可验证的 WireGuard 握手响应。"
@@ -218,8 +189,7 @@ async def scan_warp_ips():
     repeated = await asyncio.gather(*(probe(ip) for ip in finalist_ips for _ in range(repeat_count)))
     samples = {ip: [] for ip in finalist_ips}
     for ip, latency in repeated:
-        if latency >= 0:
-            samples[ip].append(latency)
+        if latency >= 0: samples[ip].append(latency)
 
     ranked = []
     for ip in finalist_ips:
@@ -240,14 +210,12 @@ async def scan_warp_ips():
 def update_cloudflare_ddns(ip):
     print(f"🌐 正在将优选 IP ({ip}) 更新到 Cloudflare DDNS ({RECORD_NAME})...")
     url = f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records/{RECORD_ID}"
-    headers = {
-        "Authorization": f"Bearer {CF_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {CF_TOKEN}", "Content-Type": "application/json"}
     data = json.dumps({"type": "A", "name": RECORD_NAME, "content": ip, "ttl": 1, "proxied": False}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="PUT")
+    
     try:
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             resp_data = json.loads(response.read().decode("utf-8"))
             if resp_data.get("success"):
                 msg = f"🎉 DDNS 更新成功！"
@@ -268,7 +236,7 @@ async def main_loop():
         return
         
     print("==========================================")
-    print("🐉 WARP DDNS 自动化任务已启动")
+    print("🐉 小龙女她爸 - WARP DDNS 自动化任务已启动")
     print(f"📌 目标域名: {RECORD_NAME}")
     print(f"⏱️  执行间隔: {INTERVAL_MINUTES} 分钟")
     
@@ -286,17 +254,27 @@ async def main_loop():
     
     while True:
         try:
-            need_rescan = force_rescan
+            # 核心修复点：如果没有可用 IP 兜底，强制进入扫描状态
+            need_rescan = force_rescan or (current_active_ip is None)
             
             if current_active_ip and not force_rescan:
                 print(f"[{time.strftime('%H:%M:%S')}] 🔍 正在检测当前在用节点 ({current_active_ip}) 的连通性...")
-                _, latency = await async_wireguard_ping(current_active_ip, PREFERRED_IP_PRIVATE_KEY, PREFERRED_IP_PEER_PUBLIC_KEY, timeout=2.5)
                 
-                if latency >= 0:
-                    print(f"✅ 当前节点依然畅通 (延迟: {latency}ms)，跳过本轮优选。\n")
+                # 为了计算抖动和准确延迟，改成连测3次
+                latencies = []
+                for _ in range(3):
+                    _, lat = await async_wireguard_ping(current_active_ip, PREFERRED_IP_PRIVATE_KEY, PREFERRED_IP_PEER_PUBLIC_KEY, timeout=2.5)
+                    if lat >= 0:
+                        latencies.append(lat)
+                
+                if latencies:
+                    median_ms = round(statistics.median(latencies), 2)
+                    jitter_ms = round(statistics.pstdev(latencies), 2) if len(latencies) > 1 else 0.0
+                    
+                    print(f"✅ 检查到上次推送的IP {current_active_ip} 状态良好 | 延迟: {median_ms}ms | 抖动: {jitter_ms}ms，无需更换，所以继续进入休眠。\n")
                     need_rescan = False
                 else:
-                    msg = f"❌ 当前节点 {current_active_ip} 已失效或被阻断，准备重新优选..."
+                    msg = f"❌ 当前节点 {current_active_ip} 3次探测均无响应，已失效或被阻断，准备重新优选..."
                     print(msg)
                     send_tg_msg(msg)
                     need_rescan = True
@@ -307,6 +285,7 @@ async def main_loop():
                     success, ddns_msg = update_cloudflare_ddns(best_ip)
                     if success:
                         current_active_ip = best_ip
+                        force_rescan = False
                     send_tg_msg(f"{stats_msg}\n{ddns_msg}")
                 else:
                     print("未找到有效节点，中止本次更新。\n")
