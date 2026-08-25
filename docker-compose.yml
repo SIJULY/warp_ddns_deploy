@@ -1,12 +1,17 @@
 services:
   warp-ddns:
     build: .
-    container_name: warp-ddns-scanner
+    container_name: xlntb-warp-ddns
     restart: unless-stopped
     env_file:
       - .env
-    # 必须使用 host 网络，防止 Docker bridge NAT 的端口映射导致 UDP RTT 延迟测不准
-    network_mode: "host" 
+    environment:
+      # ▼ 将这里改为 POSIX 时区格式
+      - TZ=CST-8
+    network_mode: "host"
+    volumes:
+      - /etc/openclash/proxy_provider:/app/output
+      # ▼ 删除 /etc/localtime 那一行
     logging:
       driver: "json-file"
       options:
