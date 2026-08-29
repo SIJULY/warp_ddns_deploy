@@ -177,7 +177,6 @@ async def scan_warp_ips():
     return best["ip"], res_msg
 
 def update_local_proxy_file(ip):
-    """将 IP 直接写入供 OpenClash 读取的本地 YAML 配置文件"""
     yaml_content = f"""proxies:
   - name: ☁️ WARP节点
     type: wireguard
@@ -235,9 +234,11 @@ async def main_loop():
             if need_rescan:
                 best_ip, stats_msg = await scan_warp_ips()
                 if best_ip:
-                    update_local_proxy_file(best_ip)  # 新增：直接覆写本地 YAML 给 OpenClash 用
-                    success, ddns_msg = update_cloudflare_ddns(best_ip)
-                    if success: current_active_ip = best_ip; force_rescan = False
+                    update_local_proxy_file(best_ip)
+                    success_ddns, ddns_msg = update_cloudflare_ddns(best_ip)
+                    
+                    if success_ddns: 
+                        current_active_ip = best_ip; force_rescan = False
                     send_tg_msg(f"{stats_msg}\n{ddns_msg}")
                 else:
                     print("未找到有效节点。\n"); send_tg_msg(stats_msg)
