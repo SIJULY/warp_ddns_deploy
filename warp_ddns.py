@@ -125,6 +125,8 @@ async def async_wireguard_ping(ip, private_key_b64, peer_public_key_b64, timeout
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
     loop = asyncio.get_running_loop()
+    max_recv_errors = 5  # 防止 ConnectionRefusedError 等异常导致死循环
+    recv_errors = 0
     try:
         msg, state = build_wireguard_initiation(private_key_b64, peer_public_key_b64)
         start_time = time.perf_counter()
@@ -136,12 +138,16 @@ async def async_wireguard_ping(ip, private_key_b64, peer_public_key_b64, timeout
                 data, _ = await asyncio.wait_for(loop.sock_recvfrom(sock, 1024), timeout - elapsed)
                 if validate_wireguard_response(data, state): return ip, round((time.perf_counter() - start_time) * 1000, 2)
             except asyncio.TimeoutError: return ip, -1
-            except Exception: pass
+            except Exception:
+                recv_errors += 1
+                if recv_errors >= max_recv_errors: return ip, -1
+                await asyncio.sleep(0.05)  # 让出事件循环，避免 CPU 空转死循环
     except Exception: return ip, -1
     finally: sock.close()
 
 async def scan_warp_ips():
-    sample_size = 100; concurrency = 25; finalists = 10; repeat_count = 3
+    sample_size = 100; concurrency = 25; finalists = 10; repeat_count = 5
+    probe_interval = 1.5  # 每次复测探测之间的间隔（秒），避免触发 CF 速率限制
     print(f"[{time.strftime('%H:%M:%S')}] 📦 正在抽取 {sample_size} 个 IP 进行初筛...")
     ips = get_random_ips(sample_size)
     semaphore = asyncio.Semaphore(concurrency)
@@ -156,10 +162,15 @@ async def scan_warp_ips():
     finalist_ips = [ip for ip, _ in valid_results[:finalists]]
     print(f"[{time.strftime('%H:%M:%S')}] ✅ 初筛发现 {len(valid_results)} 个，复测前 {len(finalist_ips)} 名...")
     
-    repeated = await asyncio.gather(*(probe(ip) for ip in finalist_ips for _ in range(repeat_count)))
+    # ---- 复测：分轮串行探测，轮次间加间隔，避免并发风暴和 CF 速率限制 ----
     samples = {ip: [] for ip in finalist_ips}
-    for ip, lat in repeated:
-        if lat >= 0: samples[ip].append(lat)
+    for round_idx in range(repeat_count):
+        if round_idx > 0:
+            await asyncio.sleep(probe_interval)  # 轮次间休息，避免同 key 高频握手
+        # 每轮对所有 finalist 并发探测（不同 IP 之间并发是安全的）
+        round_results = await asyncio.gather(*(probe(ip) for ip in finalist_ips))
+        for ip, lat in round_results:
+            if lat >= 0: samples[ip].append(lat)
 
     ranked = []
     for ip in finalist_ips:
@@ -217,19 +228,56 @@ async def main_loop():
     
     current_active_ip = None; force_rescan = True 
     
+    # ---- 健康检查参数 ----
+    HEALTH_PROBE_COUNT = 5        # 每轮探测次数
+    HEALTH_PROBE_INTERVAL = 1.5   # 探测间隔（秒），避免 CF 速率限制
+    HEALTH_MIN_SUCCESS = 3        # 至少需要成功的次数 (3/5)
+    CONFIRM_WAIT = 10             # 首轮失败后等待多久再确认（秒）
+    CONFIRM_PROBE_COUNT = 3       # 确认轮探测次数
+    CONFIRM_MIN_SUCCESS = 2       # 确认轮至少成功次数 (2/3)
+    
+    async def health_check(ip, count):
+        """对指定 IP 进行带间隔的多次探测，返回 (成功次数, 延迟列表)"""
+        lats = []
+        for i in range(count):
+            if i > 0:
+                await asyncio.sleep(HEALTH_PROBE_INTERVAL)
+            _, lat = await async_wireguard_ping(ip, PREFERRED_IP_PRIVATE_KEY, PREFERRED_IP_PEER_PUBLIC_KEY, timeout=2.5)
+            if lat >= 0:
+                lats.append(lat)
+        return len(lats), lats
+    
     while True:
         try:
             need_rescan = force_rescan or (current_active_ip is None)
             if current_active_ip and not force_rescan:
                 print(f"[{time.strftime('%H:%M:%S')}] 🔍 检测当前节点 ({current_active_ip}) ...")
-                lats = [lat for _ in range(3) if (lat := (await async_wireguard_ping(current_active_ip, PREFERRED_IP_PRIVATE_KEY, PREFERRED_IP_PEER_PUBLIC_KEY, timeout=2.5))[1]) >= 0]
-                if lats:
-                    med = round(statistics.median(lats), 2); jit = round(statistics.pstdev(lats), 2) if len(lats) > 1 else 0.0
-                    print(f"✅ 检查到上次推送的IP {current_active_ip} 状态良好 | 延迟: {med}ms | 抖动: {jit}ms，无需更换，继续休眠。\n")
+                
+                # ---- 第一轮：5次探测，间隔1.5s，至少3次成功 ----
+                successes, lats = await health_check(current_active_ip, HEALTH_PROBE_COUNT)
+                
+                if successes >= HEALTH_MIN_SUCCESS:
+                    med = round(statistics.median(lats), 2)
+                    jit = round(statistics.pstdev(lats), 2) if len(lats) > 1 else 0.0
+                    print(f"✅ 节点 {current_active_ip} 健康 ({successes}/{HEALTH_PROBE_COUNT}) | 延迟: {med}ms | 抖动: {jit}ms，继续休眠。\n")
                     need_rescan = False
                 else:
-                    msg = f"❌ 当前节点 {current_active_ip} 3次探测均无响应，准备重新优选..."
-                    print(msg); send_tg_msg(msg); need_rescan = True
+                    print(f"⚠️ 首轮探测不佳 ({successes}/{HEALTH_PROBE_COUNT})，等待 {CONFIRM_WAIT}s 后确认...")
+                    
+                    # ---- 第二轮确认：等待后再测，排除短暂网络抖动 ----
+                    await asyncio.sleep(CONFIRM_WAIT)
+                    confirm_successes, confirm_lats = await health_check(current_active_ip, CONFIRM_PROBE_COUNT)
+                    
+                    if confirm_successes >= CONFIRM_MIN_SUCCESS:
+                        all_lats = lats + confirm_lats
+                        med = round(statistics.median(all_lats), 2)
+                        jit = round(statistics.pstdev(all_lats), 2) if len(all_lats) > 1 else 0.0
+                        print(f"✅ 确认轮通过 ({confirm_successes}/{CONFIRM_PROBE_COUNT})，节点仍可用 | 延迟: {med}ms | 抖动: {jit}ms\n")
+                        need_rescan = False
+                    else:
+                        total_fail = f"{successes}/{HEALTH_PROBE_COUNT} + 确认 {confirm_successes}/{CONFIRM_PROBE_COUNT}"
+                        msg = f"❌ 当前节点 {current_active_ip} 两轮探测均不达标 ({total_fail})，准备重新优选..."
+                        print(msg); send_tg_msg(msg); need_rescan = True
                     
             if need_rescan:
                 best_ip, stats_msg = await scan_warp_ips()
