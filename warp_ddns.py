@@ -20,20 +20,81 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 # ================= 配置区 =================
+
+# ---------- Cloudflare API 配置 (通过 .env 环境变量注入) ----------
+# CF_TOKEN: Cloudflare API 令牌，用于调用 DDNS 更新接口
+#   获取方式: Cloudflare 控制台 → 我的个人资料 → API 令牌 → 创建令牌
+#            → 自定义令牌 → 权限选 Zone / DNS / Edit → 选择目标域名
 CF_TOKEN = os.getenv("CF_TOKEN")
+
+# ZONE_ID: Cloudflare 区域 ID，标识你的主域名所在的 DNS 区域
+#   获取方式: Cloudflare 控制台 → 点击主域名 → 概述(Overview) 页面右下方 API 区域
 ZONE_ID = os.getenv("ZONE_ID")
+
+# RECORD_ID: 要更新的那条 DNS A 记录的唯一 ID
+#   获取方式: 先在 Cloudflare DNS 页面手动创建一条 A 记录 (代理状态设为 "仅 DNS")
+#            然后通过 API 查询:
+#            curl -X GET "https://api.cloudflare.com/client/v4/zones/<ZONE_ID>/dns_records?name=<RECORD_NAME>" \
+#                 -H "Authorization: Bearer <CF_TOKEN>" -H "Content-Type: application/json"
+#            返回 JSON 中的 "id" 字段即为 RECORD_ID
 RECORD_ID = os.getenv("RECORD_ID")
+
+# RECORD_NAME: 需要自动更新 IP 的子域名，例如 "warp.example.com"
+#   用途: 脚本优选出最佳 WARP IP 后，会将该域名的 A 记录更新为该 IP
 RECORD_NAME = os.getenv("RECORD_NAME")
+
+# INTERVAL_MINUTES: 自动测速 + DDNS 更新的循环间隔 (分钟)，默认 60 分钟
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "60"))
+
+# ---------- Telegram 机器人配置 (可选，不配置则仅自动运行) ----------
+# TG_BOT_TOKEN: Telegram Bot 的 API Token
+#   获取方式: 在 Telegram 中搜索 @BotFather → /newbot → 按提示创建 → 获得 Token
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+
+# TG_CHAT_ID: 接收通知消息的 Telegram 用户或群组的 Chat ID
+#   获取方式: 向 @userinfobot 或 @RawDataBot 发送消息即可获得自己的 Chat ID
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
+# ---------- WireGuard / WARP 测速参数 (硬编码，与 OpenClash 节点配置一致) ----------
+# PREFERRED_IP_PRIVATE_KEY: WireGuard 客户端私钥 (Base64)
+#   用途: 构建 WG Handshake Initiation 包时用于密钥交换 (Noise_IK 协议)
+#   来源: 从 Cloudflare WARP 客户端注册信息中提取，需与 OpenClash 中配置的 private-key 保持一致
+#   注意: 此密钥同时被 OpenClash 的 WARP 节点使用，高频握手可能触发 CF 速率限制
 PREFERRED_IP_PRIVATE_KEY = "8I2+WOh1grMu8HaW6JTwg+B3Oh7fOPnqj4xpMWn3FU0="
+
+# PREFERRED_IP_PEER_PUBLIC_KEY: Cloudflare WARP 服务端公钥 (Base64)
+#   用途: WG 握手时用于加密和验证服务端身份
+#   来源: Cloudflare WARP 固定的服务端公钥，所有 WARP 用户共用，不会变化
+#         可从 WARP 客户端配置或 wgcf 生成的配置文件中获取
 PREFERRED_IP_PEER_PUBLIC_KEY = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+
+# CF_WARP_IPV4_CIDRS: Cloudflare WARP 的 IPv4 Anycast 地址段列表
+#   用途: 脚本从这些网段中随机抽取 IP 进行测速优选
+#   来源: Cloudflare 官方公布的 WARP 服务 IP 段
+#         参考 https://www.cloudflare.com/ips/ 以及社区整理的 WARP 专用段
 CF_WARP_IPV4_CIDRS = ["162.159.192.0/24", "162.159.193.0/24", "162.159.195.0/24", "188.114.96.0/24", "188.114.97.0/24"]
+
+# WARP_PORT: WARP WireGuard 服务的 UDP 端口号
+#   Cloudflare WARP 支持多个端口: 500, 854, 859, 864, 878, 880, 890, 891, 894, 903,
+#   908, 928, 934, 939, 942, 943, 945, 946, 955, 968, 987, 988, 1002, 1010, 1014,
+#   1018, 1070, 1074, 1180, 1387, 1701, 1843, 2371, 2408, 2506, 3138, 3476, 3581,
+#   3854, 4177, 4198, 4233, 4500, 5279, 5956, 7103, 7152, 7156, 7281, 7559, 8319, 8742, 8854, 8886
+#   这里默认使用 2408，与 OpenClash 节点配置中的 port 一致
 WARP_PORT = 2408
+
+# ---------- WireGuard Noise 协议常量 (协议规范固定值，勿修改) ----------
+# WG_CONSTRUCTION: Noise 协议框架标识符，指定使用的密码套件组合
+#   含义: Noise_IK 握手模式 + psk2 预共享密钥混合 + X25519 密钥交换 + ChaChaPoly 加密 + BLAKE2s 哈希
+#   参考: https://www.wireguard.com/protocol/ 及 Noise Protocol Framework 规范
 WG_CONSTRUCTION = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+
+# WG_IDENTIFIER: WireGuard 协议的全局标识字符串，用于初始化握手哈希链
+#   作用: 作为 BLAKE2s 哈希的初始输入，确保 WG 握手与其他 Noise 协议实现隔离
 WG_IDENTIFIER = b"WireGuard v1 zx2c4 Jason@zx2c4.com"
+
+# WG_LABEL_MAC1: MAC1 标签前缀，用于计算握手包的 mac1 字段
+#   作用: mac1 = BLAKE2s-128(HASH("mac1----" || responder_public_key), message)
+#         防止未授权的握手包消耗服务端资源 (DoS 防护的第一层)
 WG_LABEL_MAC1 = b"mac1----"
 
 def send_tg_msg(text):
